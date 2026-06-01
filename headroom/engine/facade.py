@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i + 5).
+"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i + 5 + 5R).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -42,8 +42,18 @@ Design notes
       is the live handler's default — original bytes are never preserved);
     * streaming prepends ``stream_options: {include_usage: True}`` (mirrors the
       live handler's pre-send injection at line ~2026-2029).
-  ``(Provider.OPENAI, Flavor.RESPONSES)`` raises ``NotImplementedError`` with a
-  clear message pointing to the responses follow-up task.
+- **Chunk 5R — OpenAI responses path**: ``_on_request_openai_responses`` wires
+  ``(Provider.OPENAI, Flavor.RESPONSES)``.  Key differences from chat:
+    * compression gate is ``config.optimize and not _bypass`` (NO
+      ``CompressionDecision.decide`` — the live handler skips that for
+      /v1/responses and checks only ``config.optimize``);
+    * compression uses ``_compress_openai_responses_payload`` (ContentRouter on
+      input[] items) NOT ``pipeline.apply`` — reused via ``_ResponsesCompressor``
+      adapter rather than reimplemented;
+    * NO ``stream_options`` injection — the live responses handler does NOT add
+      ``stream_options`` before forwarding (unlike chat);
+    * passthrough (no compression): returns raw inbound bytes byte-identical;
+    * compressed: canonical re-serialization of the mutated body.
 """
 
 from __future__ import annotations
@@ -153,6 +163,60 @@ class OpenAIComponents:
         self.get_compression_cache = get_compression_cache
         self.config = config
         self.usage_reporter = usage_reporter
+
+
+class _ResponsesCompressor:
+    """Minimal adapter that exposes the fields ``_compress_openai_responses_payload``
+    reads from ``self`` on ``OpenAIHandlerMixin``.
+
+    ``_compress_openai_responses_payload`` accesses exactly:
+      - ``self.openai_pipeline`` (passed to ``find_content_router``)
+      - ``self.openai_provider`` (``get_token_counter``)
+      - ``self.OPENAI_RESPONSES_OUTPUT_TYPES`` (class constant)
+      - ``self.OPENAI_RESPONSES_ROUTER_MIN_BYTES`` (class constant)
+      - ``self._compress_openai_responses_live_text_units_with_router`` (calls sub-method)
+
+    Rather than instantiating the full ``HeadroomProxy``, we monkey-duck the
+    minimum surface needed and call the unbound method directly.  This is NOT a
+    reimplementation — we import the real method from the handler module and
+    bind it to this adapter.
+
+    The ``_compress_openai_responses_live_text_units_with_router`` sub-method
+    also accesses ``self.openai_pipeline``, ``self.openai_provider``,
+    ``self.OPENAI_RESPONSES_OUTPUT_TYPES``, and
+    ``self.OPENAI_RESPONSES_ROUTER_MIN_BYTES`` — all forwarded from the same
+    ``OpenAIComponents`` source.
+
+    Do NOT add extra attributes: stay minimal so any future change to the
+    handler surface is immediately visible as an AttributeError rather than
+    silently wrong.
+    """
+
+    # Class-level constants mirror OpenAIHandlerMixin exactly.
+    OPENAI_RESPONSES_ROUTER_MIN_BYTES: int = 512
+    OPENAI_RESPONSES_OUTPUT_TYPES: frozenset[str] = frozenset(
+        {
+            "custom_tool_call_output",
+            "function_call_output",
+            "local_shell_call_output",
+            "apply_patch_call_output",
+        }
+    )
+
+    def __init__(self, openai_pipeline: Any, openai_provider: Any) -> None:
+        self.openai_pipeline = openai_pipeline
+        self.openai_provider = openai_provider
+
+        # Bind the real handler methods to this adapter.  Importing here keeps
+        # the adapter self-contained and makes the binding explicit.
+        from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+
+        self._compress_openai_responses_payload = (  # type: ignore[method-assign]
+            OpenAIHandlerMixin._compress_openai_responses_payload.__get__(self)
+        )
+        self._compress_openai_responses_live_text_units_with_router = (  # type: ignore[method-assign]
+            OpenAIHandlerMixin._compress_openai_responses_live_text_units_with_router.__get__(self)
+        )
 
 
 class MemoryComponents:
@@ -392,12 +456,14 @@ class HeadroomEngine:
                 return self._on_request_openai_chat(ctx)
             # Fall through to fake-pipeline path if no openai_components.
 
-        # OpenAI Responses path — not yet wired (follow-up task).
+        # Real OpenAI responses path (Chunk 5R)
         if ctx.provider == Provider.OPENAI and ctx.flavor == Flavor.RESPONSES:
-            raise NotImplementedError(
-                "HeadroomEngine: (Provider.OPENAI, Flavor.RESPONSES) is not yet wired. "
-                "The /v1/responses engine path is handled in a follow-up task. "
-                "Use the live OpenAI responses handler directly for now."
+            if self._openai_components is not None:
+                return self._on_request_openai_responses(ctx)
+            raise KeyError(
+                "HeadroomEngine: (Provider.OPENAI, Flavor.RESPONSES) requires "
+                "openai_components to be injected. Pass OpenAIComponents to "
+                "HeadroomEngine.__init__ to enable the responses path."
             )
 
         # Legacy fake-pipeline path (Chunks 1-2)
@@ -1073,6 +1139,109 @@ class HeadroomEngine:
                 bytes_saved=bytes_saved,
                 compressed=compressed,
             ),
+        )
+
+    # ── Real OpenAI responses orchestration (Chunk 5R) ───────────────────────
+
+    def _on_request_openai_responses(self, ctx: RequestContext) -> RequestDecision:
+        """Reproduce the OpenAI /v1/responses compression-core.
+
+        Mirrors ``OpenAIHandlerMixin.handle_openai_responses`` through:
+          bypass detection → (optimize and not bypass):
+            ``_compress_openai_responses_payload`` → canonical serialization
+          else:
+            raw inbound bytes byte-identical.
+
+        Key differences from the chat path that are faithfully preserved:
+
+        1. **Compression gate** — ``config.optimize and not _bypass`` only.
+           The responses handler does NOT call ``CompressionDecision.decide``
+           before compression; it uses only ``config.optimize`` (policy was
+           already resolved at request entry in the live server context).
+
+        2. **Compressor** — ``_compress_openai_responses_payload`` via
+           ``_ResponsesCompressor`` adapter (ContentRouter on input[] items),
+           NOT ``pipeline.apply``.  Reused, not reimplemented.
+
+        3. **No stream_options injection** — the live responses handler does NOT
+           inject ``stream_options: {include_usage: True}`` before forwarding
+           (the chat handler does; responses does not).  Confirmed by the
+           ``openai_responses_streaming_passthrough`` golden fixture which shows
+           ``stream=True`` inbound but no ``stream_options`` in the outbound.
+
+        4. **Passthrough = raw bytes** — when compression does not fire the
+           inbound bytes are returned unchanged (same object, no re-serialization).
+
+        5. **No tool sort** — responses tools are flat dicts (no nested
+           ``function`` key); the live handler does not sort them.
+
+        Excluded: memory injection, CCR, beta-header sticky merge, image
+        compression, hooks — all off in the golden corpus's
+        ``_DEFAULT_CONFIG_KWARGS``.
+        """
+        from headroom.proxy.helpers import serialize_body_canonical
+
+        oc = self._openai_components
+        assert oc is not None
+
+        original_body_bytes = ctx.raw_body
+
+        # Parse body — raises loudly on malformed JSON.
+        try:
+            body: dict[str, Any] = json.loads(original_body_bytes)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"on_request(openai_responses): unparseable JSON body: {exc}") from exc
+
+        model: str = body.get("model", "unknown")
+        request_id = ctx.request_id
+
+        # Bypass detection — identical gates to the live handler.
+        headers = dict(ctx.headers_view)
+        _bypass = (
+            headers.get("x-headroom-bypass", "").strip().lower() == "true"
+            or headers.get("x-headroom-mode", "").strip().lower() == "passthrough"
+        )
+
+        # Compression gate: ``config.optimize and not _bypass``.
+        # The responses handler does NOT call CompressionDecision.decide;
+        # it only checks config.optimize (policy was resolved at request entry).
+        if oc.config.optimize and not _bypass:
+            compressor = _ResponsesCompressor(
+                openai_pipeline=oc.pipeline,
+                openai_provider=oc.provider,
+            )
+            (
+                body,
+                _modified,
+                _tokens_saved,
+                _transforms,
+                _reason,
+                _bytes_before,
+                _bytes_after,
+                _attempted_tokens,
+            ) = compressor._compress_openai_responses_payload(
+                body,
+                model=model,
+                request_id=request_id,
+            )
+
+            if _modified:
+                # Body was mutated by compressor: canonical re-serialization.
+                outbound_bytes = serialize_body_canonical(body)
+                bytes_saved = max(0, len(original_body_bytes) - len(outbound_bytes))
+                return RequestDecision(
+                    body=outbound_bytes,
+                    telemetry=ResponseTelemetry(
+                        bytes_saved=bytes_saved,
+                        compressed=True,
+                    ),
+                )
+
+        # No compression (optimize=False, bypass, or compressor no-op):
+        # return raw inbound bytes byte-identical — same object, no re-serialization.
+        return RequestDecision(
+            body=original_body_bytes,
+            telemetry=ResponseTelemetry(compressed=False),
         )
 
     # ── Legacy fake-pipeline path (Chunks 1-2) ────────────────────────────────

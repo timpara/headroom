@@ -1,39 +1,27 @@
-"""Chunk 5 parity test — HeadroomEngine vs OpenAI golden handler output.
+"""Chunk 5 + 5R parity test — HeadroomEngine vs OpenAI golden handler output.
 
-For each chat golden fixture recorded in the OpenAI oracle (Chunk 5 recording):
+For each golden fixture recorded in the OpenAI oracle:
   1. Builds a real HeadroomEngine wired to OpenAIComponents (same TransformPipeline,
      same OpenAIProvider as the proxy server).
   2. Seeds the engine's prefix-tracker store with the fixture's controlled state
      (same _FixedTracker the golden recorder uses).
-  3. Builds a RequestContext from the fixture's ``inbound_b64`` bytes + headers.
+  3. Builds a RequestContext from the fixture's ``inbound_b64`` bytes + headers,
+     using ``Flavor.CHAT`` for /v1/chat/completions fixtures and
+     ``Flavor.RESPONSES`` for /v1/responses fixtures.
   4. Calls ``engine.on_request(ctx)`` — sync, no FastAPI involved.
   5. Asserts ``decision.body == fix.outbound_bytes`` (byte-exact).
 
 Scope
 -----
-Only ``/v1/chat/completions`` fixtures are driven through the engine here
-(16 fixtures in the current corpus).  The 6 ``/v1/responses`` fixtures are
-DEFERRED — the engine's ``(Provider.OPENAI, Flavor.RESPONSES)`` path raises
-``NotImplementedError`` until the responses follow-up task is complete.
+All 22 fixtures are now byte-exact: 16 ``/v1/chat/completions`` + 6
+``/v1/responses``.  The responses path is wired via
+``_on_request_openai_responses`` (Chunk 5R) using the
+``_ResponsesCompressor`` adapter which delegates to the real handler method.
 
-DEFERRED_RESPONSES_FIXTURES
-----------------------------
-These fixtures will be handled in the follow-up task that wires
-``_on_request_openai_responses`` into the engine.  Required additions:
-  - ``_compress_openai_responses_payload`` logic (function_call_output
-    compression via ContentRouter on the Responses API body shape).
-  - ``instructions`` field passthrough (cache hot-zone, no compression).
-  - ``reasoning`` field passthrough.
-  - Streaming path (stream_options injection on /v1/responses is NOT done
-    by the live handler — check before wiring).
-  - CCR / memory injection on the responses path (currently off in corpus).
-
-Notes for the responses follow-up + OpenAI CCR/memory/shadow/flip
-------------------------------------------------------------------
-  - ``OpenAIComponents`` is identical to ``AnthropicComponents`` in shape;
-    the responses follow-up can reuse the same store / cache pattern.
+Notes for OpenAI CCR/memory/shadow/flip
+----------------------------------------
   - CCR on OpenAI is wired via ``CCRComponents`` in the same way as Anthropic —
-    the engine already has the hook seam; just add the responses orchestrator.
+    the engine already has the hook seam; add the responses orchestrator when needed.
   - Memory injection on OpenAI chat: the live handler uses
     ``append_text_to_latest_user_chat_message`` (not the Anthropic helper);
     wire via ``MemoryComponents`` in the same ``mc is not None`` block pattern.
@@ -72,20 +60,14 @@ seed_all_openai_golden_fixtures()
 _ALL_FIXTURES: list[OpenAIGoldenFixture] = load_all_openai_golden_fixtures()
 
 # ---------------------------------------------------------------------------
-# DEFERRED: /v1/responses fixtures
+# /v1/responses fixtures — now fully wired (Chunk 5R)
 # ---------------------------------------------------------------------------
 
-# These fixtures target the /v1/responses endpoint which the engine does not
-# yet handle (``NotImplementedError`` guard in place).  They will be driven
-# through the engine once ``_on_request_openai_responses`` is implemented.
-DEFERRED_RESPONSES_FIXTURES: set[str] = {
-    "openai_responses_payg_passthrough",
-    "openai_responses_instructions_passthrough",
-    "openai_responses_fco_large",
-    "openai_responses_bypass",
-    "openai_responses_streaming_passthrough",
-    "openai_responses_reasoning_items_passthrough",
-}
+# All 6 responses fixtures are byte-exact against the engine's
+# ``_on_request_openai_responses`` path.  DEFERRED_RESPONSES_FIXTURES is kept
+# as an empty set so the guard test below (``test_deferred_responses_fixtures_are_valid_names``)
+# still passes without change.
+DEFERRED_RESPONSES_FIXTURES: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Controlled session store — deterministic, isolated per fixture
@@ -190,8 +172,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def test_openai_engine_parity(openai_golden_fixture: OpenAIGoldenFixture) -> None:
     """Engine produces byte-identical outbound body to the recorded golden.
 
-    For /v1/responses fixtures: explicitly xfail with a note pointing to the
-    responses follow-up task (not yet wired in the engine).
+    For /v1/responses fixtures: drives the engine's
+    ``_on_request_openai_responses`` path (Chunk 5R) — byte-exact.
 
     For nondeterministic chat fixtures: existence-check only.
 
@@ -199,21 +181,16 @@ def test_openai_engine_parity(openai_golden_fixture: OpenAIGoldenFixture) -> Non
     """
     fix = openai_golden_fixture
 
-    if fix.name in DEFERRED_RESPONSES_FIXTURES:
-        pytest.xfail(
-            f"Fixture '{fix.name}' targets /v1/responses which is DEFERRED — "
-            "the engine's (Provider.OPENAI, Flavor.RESPONSES) path is not yet "
-            "wired.  Implement _on_request_openai_responses in the responses "
-            "follow-up task."
-        )
-
     from headroom.engine.contract import Flavor, Provider, RequestContext
 
     engine = _build_openai_engine_for_fixture(fix)
 
+    # Route to the correct flavor based on the fixture's endpoint.
+    flavor = Flavor.RESPONSES if fix.endpoint == "/v1/responses" else Flavor.CHAT
+
     ctx = RequestContext(
         provider=Provider.OPENAI,
-        flavor=Flavor.CHAT,
+        flavor=flavor,
         headers_view=fix.headers,
         raw_body=fix.inbound_bytes,
         session_key=f"openai-parity-{fix.name}",
@@ -286,8 +263,10 @@ def test_openai_engine_parity_coverage_summary() -> None:
     assert len(byte_exact_chat) >= 16, (
         f"Expected at least 16 byte-exact chat fixtures; found {len(byte_exact_chat)}"
     )
-    assert len(responses_fixtures) == len(DEFERRED_RESPONSES_FIXTURES), (
-        f"All responses fixtures should be in DEFERRED_RESPONSES_FIXTURES; "
-        f"found {len(responses_fixtures)} responses fixtures, "
-        f"{len(DEFERRED_RESPONSES_FIXTURES)} deferred entries"
+    assert len(responses_fixtures) >= 6, (
+        f"Expected at least 6 /v1/responses fixtures; found {len(responses_fixtures)}"
+    )
+    assert len(DEFERRED_RESPONSES_FIXTURES) == 0, (
+        "DEFERRED_RESPONSES_FIXTURES should be empty — all responses fixtures "
+        "are now wired (Chunk 5R)"
     )
