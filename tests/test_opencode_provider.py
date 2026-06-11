@@ -86,7 +86,8 @@ class TestProviderScope:
         assert result is not None
         payload = json.loads(config_path.read_text())
         assert (
-            payload["provider"]["github-copilot"]["options"]["baseURL"] == "http://127.0.0.1:8787"
+            payload["provider"]["github-copilot"]["options"]["baseURL"]
+            == "http://127.0.0.1:8787/v1"
         )
         assert payload["provider"]["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:8787"
         assert payload["provider"]["openai"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
@@ -372,7 +373,12 @@ class TestWrapPrepareOnly:
         from headroom.cli.wrap import wrap
 
         runner = CliRunner()
-        with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with (
+            patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+            patch("headroom.cli.wrap._selected_context_tool", return_value="rtk"),
+            patch("headroom.providers.opencode.install._patch_copilot_base_url") as mock_patch_url,
+            patch("headroom.cli.wrap._launch_tool") as mock_launch,
+        ):
             result = runner.invoke(
                 wrap,
                 ["opencode", "--prepare-only", "--no-proxy"],
@@ -380,6 +386,10 @@ class TestWrapPrepareOnly:
             )
         # --prepare-only should return early without errors.
         assert result.exit_code == 0
+        # Should patch opencode.json for github-copilot routing.
+        mock_patch_url.assert_called_once_with(8787)
+        # Should NOT launch the tool.
+        mock_launch.assert_not_called()
 
     def test_prepare_only_does_not_require_opencode_binary(self, tmp_path: Path) -> None:
         from click.testing import CliRunner
@@ -389,6 +399,8 @@ class TestWrapPrepareOnly:
         runner = CliRunner()
         with (
             patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+            patch("headroom.cli.wrap._selected_context_tool", return_value="rtk"),
+            patch("headroom.providers.opencode.install._patch_copilot_base_url"),
             patch("shutil.which", return_value=None),
         ):
             result = runner.invoke(

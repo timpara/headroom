@@ -22,7 +22,7 @@ from .runtime import proxy_base_url, proxy_openai_url
 
 # Providers whose baseURL we patch in opencode.json.
 _PROVIDERS: dict[str, str] = {
-    "github-copilot": "",  # Anthropic-protocol (no /v1 suffix)
+    "github-copilot": "/v1",  # OpenAI-protocol (Copilot speaks OpenAI wire format)
     "anthropic": "",  # Anthropic-protocol
     "openai": "/v1",  # OpenAI-protocol
 }
@@ -122,7 +122,7 @@ def _patch_copilot_base_url(port: int) -> None:
             # Don't overwrite a broken config silently.
             return
 
-    base = proxy_base_url(port)
+    base = proxy_openai_url(port)
     opts = (
         payload.setdefault("provider", {})
         .setdefault("github-copilot", {})
